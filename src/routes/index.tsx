@@ -12,8 +12,10 @@ import {
   parseJsonSchema,
   validateJsonSchema,
 } from '../utils/schemaParser'
+import { validateField, validateData } from '../utils/validation'
+import { getFieldHistory, addToFieldHistory } from '../utils/fieldHistory'
 import { SchemaField } from '../types/snowplow'
-import { Copy, Check, Code, FileJson } from 'lucide-react'
+import { Copy, Check, Code, FileJson, Play, Loader2, AlertCircle, Clock } from 'lucide-react'
 
 export const Route = createFileRoute('/')({
   component: Builder,
@@ -109,11 +111,23 @@ function Builder() {
   // Context entities
   const [contextSchemas, setContextSchemas] = useState<Array<{
     schema: string
+    schemaJson: string
     dataJson: string
     data: Record<string, any>
+    fields: SchemaField[]
+    errors: Record<string, string>
   }>>([])
   
   const [copied, setCopied] = useState(false)
+  const [testLoading, setTestLoading] = useState(false)
+  const [testResponse, setTestResponse] = useState<{
+    status?: number
+    statusText?: string
+    headers?: Record<string, string>
+    body?: any
+    error?: string
+  } | null>(null)
+  const [fieldHistoryVisible, setFieldHistoryVisible] = useState<Record<string, boolean>>({})
 
   // Parse JSON schema for self-describing event
   const selfDescribingFields = useMemo(() => {
@@ -126,12 +140,15 @@ function Builder() {
     }
   }, [selfDescribingSchemaJson])
 
+  // Generate a stable event ID that only changes when event type changes
+  const eventId = useMemo(() => generateUUID(), [eventType])
+
   // Build the request object
   const request = useMemo((): SnowplowRequest => {
     const req: SnowplowRequest = {
       event: {
         e: eventType,
-        eid: generateUUID(),
+        eid: eventId,
       },
     }
 
@@ -262,6 +279,7 @@ function Builder() {
     return req
   }, [
     eventType,
+    eventId,
     appParams,
     timestampParams,
     userParams,
@@ -289,24 +307,148 @@ function Builder() {
     setTimeout(() => setCopied(false), 2000)
   }
 
+  const testRequest = async () => {
+    setTestLoading(true)
+    setTestResponse(null)
+    
+    try {
+      // Try CORS mode first to get full response details
+      const response = await fetch(generatedUrl, {
+        method: 'GET',
+        mode: 'cors',
+        credentials: 'omit',
+      })
+      
+      const headers: Record<string, string> = {}
+      response.headers.forEach((value, key) => {
+        headers[key] = value
+      })
+      
+      let body: any
+      const contentType = response.headers.get('content-type')
+      if (contentType && contentType.includes('application/json')) {
+        body = await response.json()
+      } else if (contentType && contentType.includes('image/')) {
+        // Snowplow typically returns a 1x1 pixel GIF
+        body = `Image response (${contentType}) - Snowplow collector received the event successfully`
+      } else {
+        const text = await response.text()
+        body = text || '(empty response)'
+      }
+      
+      setTestResponse({
+        status: response.status,
+        statusText: response.statusText,
+        headers,
+        body,
+      })
+    } catch (error) {
+      // If CORS fails, try no-cors mode (request will be sent but response can't be read)
+      try {
+        await fetch(generatedUrl, {
+          method: 'GET',
+          mode: 'no-cors',
+        })
+        
+        // With no-cors mode, we can't read the response, but the request was sent
+        setTestResponse({
+          status: 0,
+          statusText: 'Request sent (no-cors mode)',
+          body: 'The request was sent successfully, but the response cannot be read due to CORS restrictions. This is normal for Snowplow collectors. Check your Snowplow collector logs or dashboard to verify the event was received.',
+        })
+      } catch (noCorsError) {
+        setTestResponse({
+          error: `Request failed: ${error instanceof Error ? error.message : 'Unknown error'}. Please check the URL and ensure your Snowplow collector is accessible.`,
+        })
+      }
+    } finally {
+      setTestLoading(false)
+    }
+  }
+
   const addContextEntity = () => {
-    setContextSchemas([...contextSchemas, { schema: '', dataJson: '{}', data: {} }])
+    setContextSchemas([...contextSchemas, { 
+      schema: '', 
+      schemaJson: '',
+      dataJson: '{}', 
+      data: {},
+      fields: [],
+      errors: {}
+    }])
   }
 
   const removeContextEntity = (index: number) => {
     setContextSchemas(contextSchemas.filter((_, i) => i !== index))
   }
 
-  const updateContextEntity = (index: number, field: 'schema' | 'dataJson', value: string) => {
+  const updateContextEntity = (index: number, field: 'schema' | 'schemaJson' | 'dataJson', value: string) => {
     const updated = [...contextSchemas]
     updated[index] = { ...updated[index], [field]: value }
-    if (field === 'dataJson') {
+    
+    if (field === 'schemaJson') {
       try {
-        updated[index].data = JSON.parse(value)
+        const schema = JSON.parse(value)
+        const fields = parseJsonSchema(schema)
+        updated[index].fields = fields
+        // Initialize data with empty values for new fields
+        const newData: Record<string, any> = { ...updated[index].data }
+        fields.forEach(field => {
+          if (!(field.name in newData)) {
+            newData[field.name] = ''
+          }
+        })
+        updated[index].data = newData
+        updated[index].dataJson = JSON.stringify(newData, null, 2)
+        // Validate the data
+        const validation = validateData(fields, newData)
+        updated[index].errors = validation.errors
+      } catch {
+        // Invalid JSON, keep previous fields
+        updated[index].fields = []
+      }
+    } else if (field === 'dataJson') {
+      try {
+        const parsed = JSON.parse(value)
+        updated[index].data = parsed
+        // Validate if we have fields
+        if (updated[index].fields.length > 0) {
+          const validation = validateData(updated[index].fields, parsed)
+          updated[index].errors = validation.errors
+        }
       } catch {
         // Invalid JSON, keep previous data
       }
     }
+    
+    setContextSchemas(updated)
+  }
+
+  const updateContextEntityData = (index: number, fieldName: string, value: any) => {
+    const updated = [...contextSchemas]
+    const newData = { ...updated[index].data, [fieldName]: value }
+    updated[index].data = newData
+    updated[index].dataJson = JSON.stringify(newData, null, 2)
+    
+    // Validate the field
+    if (updated[index].fields.length > 0) {
+      const field = updated[index].fields.find(f => f.name === fieldName)
+      if (field) {
+        const validation = validateField(field, value)
+        if (validation.valid) {
+          // Remove error for this field
+          const newErrors = { ...updated[index].errors }
+          delete newErrors[fieldName]
+          updated[index].errors = newErrors
+        } else {
+          // Add error for this field
+          updated[index].errors = {
+            ...updated[index].errors,
+            [fieldName]: validation.error || 'Invalid value'
+          }
+        }
+      }
+    }
+    
     setContextSchemas(updated)
   }
 
@@ -329,12 +471,15 @@ function Builder() {
           <div className="space-y-6">
             {/* Collector URL */}
             <FormSection title="Collector URL">
-              <input
-                type="text"
+              <FormField
+                label=""
                 value={collectorUrl}
-                onChange={(e) => setCollectorUrl(e.target.value)}
-                className="w-full px-4 py-2 bg-slate-800 border border-slate-700 rounded-lg text-white focus:outline-none focus:border-cyan-500"
+                onChange={(v) => {
+                  setCollectorUrl(v)
+                  addToFieldHistory('collectorUrl', v)
+                }}
                 placeholder="https://collector.snowplow.io/i"
+                fieldName="collectorUrl"
               />
             </FormSection>
 
@@ -361,11 +506,13 @@ function Builder() {
                   label="Tracker Namespace (tna)"
                   value={appParams.tna}
                   onChange={(v) => setAppParams({ ...appParams, tna: v })}
+                  fieldName="tna"
                 />
                 <FormField
                   label="App ID (aid)"
                   value={appParams.aid}
                   onChange={(v) => setAppParams({ ...appParams, aid: v })}
+                  fieldName="aid"
                 />
                 <FormField
                   label="Platform (p)"
@@ -373,11 +520,13 @@ function Builder() {
                   onChange={(v) => setAppParams({ ...appParams, p: v as Platform })}
                   type="select"
                   options={['web', 'mob', 'pc', 'srv', 'app', 'tv', 'cnsl', 'iot']}
+                  fieldName="p"
                 />
                 <FormField
                   label="Tracker Version (tv)"
                   value={appParams.tv}
                   onChange={(v) => setAppParams({ ...appParams, tv: v })}
+                  fieldName="tv"
                 />
               </div>
             </FormSection>
@@ -390,23 +539,27 @@ function Builder() {
                   value={timestampParams.dtm}
                   onChange={(v) => setTimestampParams({ ...timestampParams, dtm: v })}
                   type="number"
+                  fieldName="dtm"
                 />
                 <FormField
                   label="Device Sent (stm)"
                   value={timestampParams.stm}
                   onChange={(v) => setTimestampParams({ ...timestampParams, stm: v })}
                   type="number"
+                  fieldName="stm"
                 />
                 <FormField
                   label="True Timestamp (ttm)"
                   value={timestampParams.ttm}
                   onChange={(v) => setTimestampParams({ ...timestampParams, ttm: v })}
                   type="number"
+                  fieldName="ttm"
                 />
                 <FormField
                   label="Timezone (tz)"
                   value={timestampParams.tz}
                   onChange={(v) => setTimestampParams({ ...timestampParams, tz: v })}
+                  fieldName="tz"
                 />
               </div>
             </FormSection>
@@ -418,32 +571,38 @@ function Builder() {
                   label="Domain User ID (duid)"
                   value={userParams.duid}
                   onChange={(v) => setUserParams({ ...userParams, duid: v })}
+                  fieldName="duid"
                 />
                 <FormField
                   label="Network User ID (tnuid)"
                   value={userParams.tnuid}
                   onChange={(v) => setUserParams({ ...userParams, tnuid: v })}
+                  fieldName="tnuid"
                 />
                 <FormField
                   label="User ID (uid)"
                   value={userParams.uid}
                   onChange={(v) => setUserParams({ ...userParams, uid: v })}
+                  fieldName="uid"
                 />
                 <FormField
                   label="Visit Index (vid)"
                   value={userParams.vid}
                   onChange={(v) => setUserParams({ ...userParams, vid: v })}
                   type="number"
+                  fieldName="vid"
                 />
                 <FormField
                   label="Session ID (sid)"
                   value={userParams.sid}
                   onChange={(v) => setUserParams({ ...userParams, sid: v })}
+                  fieldName="sid"
                 />
                 <FormField
                   label="IP Address (ip)"
                   value={userParams.ip}
                   onChange={(v) => setUserParams({ ...userParams, ip: v })}
+                  fieldName="ip"
                 />
               </div>
             </FormSection>
@@ -455,56 +614,66 @@ function Builder() {
                   label="Page URL (url)"
                   value={platformParams.url}
                   onChange={(v) => setPlatformParams({ ...platformParams, url: v })}
+                  fieldName="url"
                 />
                 <FormField
                   label="User Agent (ua)"
                   value={platformParams.ua}
                   onChange={(v) => setPlatformParams({ ...platformParams, ua: v })}
+                  fieldName="ua"
                 />
                 <div className="grid grid-cols-2 gap-4">
                   <FormField
                     label="Page Title (page)"
                     value={platformParams.page}
                     onChange={(v) => setPlatformParams({ ...platformParams, page: v })}
+                    fieldName="page"
                   />
                   <FormField
                     label="Referrer (refr)"
                     value={platformParams.refr}
                     onChange={(v) => setPlatformParams({ ...platformParams, refr: v })}
+                    fieldName="refr"
                   />
                   <FormField
                     label="Language (lang)"
                     value={platformParams.lang}
                     onChange={(v) => setPlatformParams({ ...platformParams, lang: v })}
+                    fieldName="lang"
                   />
                   <FormField
                     label="Color Depth (cd)"
                     value={platformParams.cd}
                     onChange={(v) => setPlatformParams({ ...platformParams, cd: v })}
                     type="number"
+                    fieldName="cd"
                   />
                   <FormField
                     label="Charset (cs)"
                     value={platformParams.cs}
                     onChange={(v) => setPlatformParams({ ...platformParams, cs: v })}
+                    fieldName="cs"
                   />
                   <FormField
                     label="Document Size (ds)"
                     value={platformParams.ds}
                     onChange={(v) => setPlatformParams({ ...platformParams, ds: v })}
                     placeholder="1090x1152"
+                    fieldName="ds"
                   />
                   <FormField
                     label="Viewport (vp)"
                     value={platformParams.vp}
                     onChange={(v) => setPlatformParams({ ...platformParams, vp: v })}
                     placeholder="1105x390"
+                    fieldName="vp"
                   />
                   <FormField
                     label="Resolution (res)"
                     value={platformParams.res}
                     onChange={(v) => setPlatformParams({ ...platformParams, res: v })}
                     placeholder="1280x1024"
+                    fieldName="res"
                   />
                 </div>
                 <div className="flex gap-4">
@@ -539,24 +708,28 @@ function Builder() {
                     value={pagePingParams.pp_mix}
                     onChange={(v) => setPagePingParams({ ...pagePingParams, pp_mix: v })}
                     type="number"
+                    fieldName="pp_mix"
                   />
                   <FormField
                     label="Max X Offset (pp_max)"
                     value={pagePingParams.pp_max}
                     onChange={(v) => setPagePingParams({ ...pagePingParams, pp_max: v })}
                     type="number"
+                    fieldName="pp_max"
                   />
                   <FormField
                     label="Min Y Offset (pp_miy)"
                     value={pagePingParams.pp_miy}
                     onChange={(v) => setPagePingParams({ ...pagePingParams, pp_miy: v })}
                     type="number"
+                    fieldName="pp_miy"
                   />
                   <FormField
                     label="Max Y Offset (pp_may)"
                     value={pagePingParams.pp_may}
                     onChange={(v) => setPagePingParams({ ...pagePingParams, pp_may: v })}
                     type="number"
+                    fieldName="pp_may"
                   />
                 </div>
               </FormSection>
@@ -569,49 +742,58 @@ function Builder() {
                     label="Order ID (tr_id)"
                     value={transactionParams.tr_id}
                     onChange={(v) => setTransactionParams({ ...transactionParams, tr_id: v })}
+                    fieldName="tr_id"
                   />
                   <FormField
                     label="Affiliation (tr_af)"
                     value={transactionParams.tr_af}
                     onChange={(v) => setTransactionParams({ ...transactionParams, tr_af: v })}
+                    fieldName="tr_af"
                   />
                   <FormField
                     label="Total (tr_tt)"
                     value={transactionParams.tr_tt}
                     onChange={(v) => setTransactionParams({ ...transactionParams, tr_tt: v })}
                     type="number"
+                    fieldName="tr_tt"
                   />
                   <FormField
                     label="Tax (tr_tx)"
                     value={transactionParams.tr_tx}
                     onChange={(v) => setTransactionParams({ ...transactionParams, tr_tx: v })}
                     type="number"
+                    fieldName="tr_tx"
                   />
                   <FormField
                     label="Shipping (tr_sh)"
                     value={transactionParams.tr_sh}
                     onChange={(v) => setTransactionParams({ ...transactionParams, tr_sh: v })}
                     type="number"
+                    fieldName="tr_sh"
                   />
                   <FormField
                     label="City (tr_ci)"
                     value={transactionParams.tr_ci}
                     onChange={(v) => setTransactionParams({ ...transactionParams, tr_ci: v })}
+                    fieldName="tr_ci"
                   />
                   <FormField
                     label="State (tr_st)"
                     value={transactionParams.tr_st}
                     onChange={(v) => setTransactionParams({ ...transactionParams, tr_st: v })}
+                    fieldName="tr_st"
                   />
                   <FormField
                     label="Country (tr_co)"
                     value={transactionParams.tr_co}
                     onChange={(v) => setTransactionParams({ ...transactionParams, tr_co: v })}
+                    fieldName="tr_co"
                   />
                   <FormField
                     label="Currency (tr_cu)"
                     value={transactionParams.tr_cu}
                     onChange={(v) => setTransactionParams({ ...transactionParams, tr_cu: v })}
+                    fieldName="tr_cu"
                   />
                 </div>
               </FormSection>
@@ -624,38 +806,45 @@ function Builder() {
                     label="Order ID (ti_id)"
                     value={transactionItemParams.ti_id}
                     onChange={(v) => setTransactionItemParams({ ...transactionItemParams, ti_id: v })}
+                    fieldName="ti_id"
                   />
                   <FormField
                     label="SKU (ti_sk)"
                     value={transactionItemParams.ti_sk}
                     onChange={(v) => setTransactionItemParams({ ...transactionItemParams, ti_sk: v })}
+                    fieldName="ti_sk"
                   />
                   <FormField
                     label="Name (ti_nm)"
                     value={transactionItemParams.ti_nm}
                     onChange={(v) => setTransactionItemParams({ ...transactionItemParams, ti_nm: v })}
+                    fieldName="ti_nm"
                   />
                   <FormField
                     label="Category (ti_ca)"
                     value={transactionItemParams.ti_ca}
                     onChange={(v) => setTransactionItemParams({ ...transactionItemParams, ti_ca: v })}
+                    fieldName="ti_ca"
                   />
                   <FormField
                     label="Price (ti_pr)"
                     value={transactionItemParams.ti_pr}
                     onChange={(v) => setTransactionItemParams({ ...transactionItemParams, ti_pr: v })}
                     type="number"
+                    fieldName="ti_pr"
                   />
                   <FormField
                     label="Quantity (ti_qu)"
                     value={transactionItemParams.ti_qu}
                     onChange={(v) => setTransactionItemParams({ ...transactionItemParams, ti_qu: v })}
                     type="number"
+                    fieldName="ti_qu"
                   />
                   <FormField
                     label="Currency (ti_cu)"
                     value={transactionItemParams.ti_cu}
                     onChange={(v) => setTransactionItemParams({ ...transactionItemParams, ti_cu: v })}
+                    fieldName="ti_cu"
                   />
                 </div>
               </FormSection>
@@ -668,27 +857,32 @@ function Builder() {
                     label="Category (se_ca)"
                     value={structuredEventParams.se_ca}
                     onChange={(v) => setStructuredEventParams({ ...structuredEventParams, se_ca: v })}
+                    fieldName="se_ca"
                   />
                   <FormField
                     label="Action (se_ac)"
                     value={structuredEventParams.se_ac}
                     onChange={(v) => setStructuredEventParams({ ...structuredEventParams, se_ac: v })}
+                    fieldName="se_ac"
                   />
                   <FormField
                     label="Label (se_la)"
                     value={structuredEventParams.se_la}
                     onChange={(v) => setStructuredEventParams({ ...structuredEventParams, se_la: v })}
+                    fieldName="se_la"
                   />
                   <FormField
                     label="Property (se_pr)"
                     value={structuredEventParams.se_pr}
                     onChange={(v) => setStructuredEventParams({ ...structuredEventParams, se_pr: v })}
+                    fieldName="se_pr"
                   />
                   <FormField
                     label="Value (se_va)"
                     value={structuredEventParams.se_va}
                     onChange={(v) => setStructuredEventParams({ ...structuredEventParams, se_va: v })}
                     type="number"
+                    fieldName="se_va"
                   />
                 </div>
               </FormSection>
@@ -703,6 +897,7 @@ function Builder() {
                     value={selfDescribingSchema}
                     onChange={(v) => setSelfDescribingSchema(v)}
                     placeholder="iglu:com.snowplowanalytics.snowplow/page_view/jsonschema/1-0-0"
+                    fieldName="selfDescribingSchema"
                   />
                   <div>
                     <label className="block text-sm font-medium text-gray-300 mb-2">
@@ -782,25 +977,55 @@ function Builder() {
                         Remove
                       </button>
                     </div>
-                    <div className="space-y-2">
+                    <div className="space-y-4">
                       <FormField
                         label="Schema URI"
                         value={ctx.schema}
                         onChange={(v) => updateContextEntity(index, 'schema', v)}
                         placeholder="iglu:com.snowplowanalytics.snowplow/web_page/jsonschema/1-0-0"
+                        fieldName={`context_schema_${index}`}
                       />
                       <div>
                         <label className="block text-sm font-medium text-gray-300 mb-2">
-                          Entity Data (JSON)
+                          JSON Schema (for dynamic form generation)
                         </label>
                         <textarea
-                          value={ctx.dataJson}
-                          onChange={(e) => updateContextEntity(index, 'dataJson', e.target.value)}
+                          value={ctx.schemaJson}
+                          onChange={(e) => updateContextEntity(index, 'schemaJson', e.target.value)}
                           className="w-full px-4 py-2 bg-slate-900 border border-slate-700 rounded-lg text-white font-mono text-sm focus:outline-none focus:border-cyan-500"
-                          rows={4}
-                          placeholder='{"id": "123", "name": "Homepage"}'
+                          rows={6}
+                          placeholder='{"properties": {"id": {"type": "string"}, "name": {"type": "string"}}}'
                         />
                       </div>
+                      {ctx.fields.length > 0 && (
+                        <div className="space-y-2">
+                          <label className="block text-sm font-medium text-gray-300">Entity Data</label>
+                          {ctx.fields.map((field) => (
+                            <div key={field.name}>
+                              <DynamicFormField
+                                field={field}
+                                value={ctx.data[field.name]}
+                                onChange={(value) => updateContextEntityData(index, field.name, value)}
+                                error={ctx.errors[field.name]}
+                              />
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                      {ctx.fields.length === 0 && (
+                        <div>
+                          <label className="block text-sm font-medium text-gray-300 mb-2">
+                            Entity Data (JSON)
+                          </label>
+                          <textarea
+                            value={ctx.dataJson}
+                            onChange={(e) => updateContextEntity(index, 'dataJson', e.target.value)}
+                            className="w-full px-4 py-2 bg-slate-900 border border-slate-700 rounded-lg text-white font-mono text-sm focus:outline-none focus:border-cyan-500"
+                            rows={4}
+                            placeholder='{"id": "123", "name": "Homepage"}'
+                          />
+                        </div>
+                      )}
                     </div>
                   </div>
                 ))}
@@ -822,22 +1047,41 @@ function Builder() {
                   <Code className="w-6 h-6 text-cyan-400" />
                   Generated Request
                 </h2>
-                <button
-                  onClick={copyToClipboard}
-                  className="flex items-center gap-2 px-4 py-2 bg-cyan-600 hover:bg-cyan-700 text-white rounded-lg transition-colors"
-                >
-                  {copied ? (
-                    <>
-                      <Check className="w-4 h-4" />
-                      Copied!
-                    </>
-                  ) : (
-                    <>
-                      <Copy className="w-4 h-4" />
-                      Copy
-                    </>
-                  )}
-                </button>
+                <div className="flex gap-2">
+                  <button
+                    onClick={testRequest}
+                    disabled={testLoading}
+                    className="flex items-center gap-2 px-4 py-2 bg-green-600 hover:bg-green-700 disabled:bg-green-800 disabled:opacity-50 text-white rounded-lg transition-colors"
+                  >
+                    {testLoading ? (
+                      <>
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                        Testing...
+                      </>
+                    ) : (
+                      <>
+                        <Play className="w-4 h-4" />
+                        Test
+                      </>
+                    )}
+                  </button>
+                  <button
+                    onClick={copyToClipboard}
+                    className="flex items-center gap-2 px-4 py-2 bg-cyan-600 hover:bg-cyan-700 text-white rounded-lg transition-colors"
+                  >
+                    {copied ? (
+                      <>
+                        <Check className="w-4 h-4" />
+                        Copied!
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="w-4 h-4" />
+                        Copy
+                      </>
+                    )}
+                  </button>
+                </div>
               </div>
               <div className="bg-slate-900 rounded-lg p-4 overflow-x-auto">
                 <pre className="text-sm text-gray-300 font-mono whitespace-pre-wrap break-all">
@@ -853,6 +1097,64 @@ function Builder() {
                   {JSON.stringify(request, null, 2)}
                 </pre>
               </div>
+
+              {/* Test Results Panel */}
+              {testResponse && (
+                <div className="mt-4 p-4 bg-slate-900 rounded-lg border border-slate-700">
+                  <h3 className="text-white font-medium mb-3 flex items-center gap-2">
+                    {testResponse.error ? (
+                      <AlertCircle className="w-4 h-4 text-red-400" />
+                    ) : (
+                      <Check className="w-4 h-4 text-green-400" />
+                    )}
+                    Test Response
+                  </h3>
+                  {testResponse.error ? (
+                    <div className="text-red-400 text-sm">
+                      <p className="font-medium mb-2">Error:</p>
+                      <p>{testResponse.error}</p>
+                    </div>
+                  ) : (
+                    <div className="space-y-3">
+                      {testResponse.status !== undefined && (
+                        <div>
+                          <p className="text-xs text-gray-400 mb-1">Status</p>
+                          <p className="text-sm text-white">
+                            <span className={`font-medium ${
+                              testResponse.status >= 200 && testResponse.status < 300 
+                                ? 'text-green-400' 
+                                : testResponse.status >= 400 
+                                ? 'text-red-400' 
+                                : 'text-yellow-400'
+                            }`}>
+                              {testResponse.status}
+                            </span>
+                            {testResponse.statusText && ` ${testResponse.statusText}`}
+                          </p>
+                        </div>
+                      )}
+                      {testResponse.headers && Object.keys(testResponse.headers).length > 0 && (
+                        <div>
+                          <p className="text-xs text-gray-400 mb-1">Headers</p>
+                          <pre className="text-xs text-gray-300 font-mono overflow-x-auto bg-slate-800 p-2 rounded">
+                            {JSON.stringify(testResponse.headers, null, 2)}
+                          </pre>
+                        </div>
+                      )}
+                      {testResponse.body !== undefined && (
+                        <div>
+                          <p className="text-xs text-gray-400 mb-1">Body</p>
+                          <pre className="text-xs text-gray-300 font-mono overflow-x-auto bg-slate-800 p-2 rounded max-h-64 overflow-y-auto">
+                            {typeof testResponse.body === 'string' 
+                              ? testResponse.body 
+                              : JSON.stringify(testResponse.body, null, 2)}
+                          </pre>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -884,6 +1186,7 @@ function FormField({
   type = 'text',
   options,
   placeholder,
+  fieldName,
 }: {
   label: string
   value: string
@@ -891,7 +1194,23 @@ function FormField({
   type?: 'text' | 'number' | 'select'
   options?: string[]
   placeholder?: string
+  fieldName?: string
 }) {
+  const history = fieldName ? getFieldHistory(fieldName) : []
+  const [showHistory, setShowHistory] = useState(false)
+
+  const handleChange = (newValue: string) => {
+    onChange(newValue)
+    if (fieldName && newValue.trim() !== '') {
+      addToFieldHistory(fieldName, newValue)
+    }
+  }
+
+  const handleBlur = () => {
+    // Delay hiding history to allow clicking on items
+    setTimeout(() => setShowHistory(false), 200)
+  }
+
   if (type === 'select' && options) {
     return (
       <div>
@@ -900,7 +1219,7 @@ function FormField({
         </label>
         <select
           value={value}
-          onChange={(e) => onChange(e.target.value)}
+          onChange={(e) => handleChange(e.target.value)}
           className="w-full px-4 py-2 bg-slate-900 border border-slate-700 rounded-lg text-white focus:outline-none focus:border-cyan-500"
         >
           {options.map((opt) => (
@@ -914,17 +1233,46 @@ function FormField({
   }
 
   return (
-    <div>
+    <div className="relative">
       <label className="block text-sm font-medium text-gray-300 mb-1">
         {label}
       </label>
-      <input
-        type={type}
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        placeholder={placeholder}
-        className="w-full px-4 py-2 bg-slate-900 border border-slate-700 rounded-lg text-white focus:outline-none focus:border-cyan-500"
-      />
+      <div className="relative">
+        <input
+          type={type}
+          value={value}
+          onChange={(e) => handleChange(e.target.value)}
+          onFocus={() => {
+            if (history.length > 0) {
+              setShowHistory(true)
+            }
+          }}
+          onBlur={handleBlur}
+          placeholder={placeholder}
+          className="w-full px-4 py-2 bg-slate-900 border border-slate-700 rounded-lg text-white focus:outline-none focus:border-cyan-500"
+        />
+        {history.length > 0 && showHistory && (
+          <div className="absolute z-10 w-full mt-1 bg-slate-800 border border-slate-700 rounded-lg shadow-lg max-h-48 overflow-y-auto">
+            <div className="p-2 text-xs text-gray-400 border-b border-slate-700 flex items-center gap-1">
+              <Clock className="w-3 h-3" />
+              Recent values
+            </div>
+            {history.map((item, index) => (
+              <button
+                key={index}
+                type="button"
+                onClick={() => {
+                  handleChange(item)
+                  setShowHistory(false)
+                }}
+                className="w-full text-left px-3 py-2 text-sm text-white hover:bg-slate-700 transition-colors"
+              >
+                {item}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   )
 }
@@ -933,10 +1281,12 @@ function DynamicFormField({
   field,
   value,
   onChange,
+  error,
 }: {
   field: SchemaField
   value: any
   onChange: (value: any) => void
+  error?: string
 }) {
   const handleChange = (newValue: string) => {
     let parsedValue: any = newValue
@@ -981,7 +1331,11 @@ function DynamicFormField({
         <select
           value={value || ''}
           onChange={(e) => handleChange(e.target.value)}
-          className="w-full px-4 py-2 bg-slate-900 border border-slate-700 rounded-lg text-white focus:outline-none focus:border-cyan-500"
+          className={`w-full px-4 py-2 bg-slate-900 border rounded-lg text-white focus:outline-none ${
+            error 
+              ? 'border-red-500 focus:border-red-500' 
+              : 'border-slate-700 focus:border-cyan-500'
+          }`}
         >
           <option value="">Select...</option>
           {field.enum.map((opt) => (
@@ -990,7 +1344,10 @@ function DynamicFormField({
             </option>
           ))}
         </select>
-        {field.description && (
+        {error && (
+          <p className="text-xs text-red-400 mt-1">{error}</p>
+        )}
+        {field.description && !error && (
           <p className="text-xs text-gray-400 mt-1">{field.description}</p>
         )}
       </div>
@@ -1006,10 +1363,17 @@ function DynamicFormField({
         type={field.type === 'number' || field.type === 'integer' ? 'number' : 'text'}
         value={value || ''}
         onChange={(e) => handleChange(e.target.value)}
-        className="w-full px-4 py-2 bg-slate-900 border border-slate-700 rounded-lg text-white focus:outline-none focus:border-cyan-500"
+        className={`w-full px-4 py-2 bg-slate-900 border rounded-lg text-white focus:outline-none ${
+          error 
+            ? 'border-red-500 focus:border-red-500' 
+            : 'border-slate-700 focus:border-cyan-500'
+        }`}
         placeholder={field.description}
       />
-      {field.description && (
+      {error && (
+        <p className="text-xs text-red-400 mt-1">{error}</p>
+      )}
+      {field.description && !error && (
         <p className="text-xs text-gray-400 mt-1">{field.description}</p>
       )}
     </div>
