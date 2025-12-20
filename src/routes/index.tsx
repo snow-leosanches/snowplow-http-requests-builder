@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useEffect } from 'react'
 import { createFileRoute } from '@tanstack/react-router'
 import {
   EventType,
@@ -1196,8 +1196,15 @@ function FormField({
   placeholder?: string
   fieldName?: string
 }) {
-  const history = fieldName ? getFieldHistory(fieldName) : []
+  const [history, setHistory] = useState<string[]>([])
   const [showHistory, setShowHistory] = useState(false)
+
+  // Load history only on client side
+  useEffect(() => {
+    if (fieldName && typeof window !== 'undefined') {
+      setHistory(getFieldHistory(fieldName))
+    }
+  }, [fieldName])
 
   const handleChange = (newValue: string) => {
     onChange(newValue)

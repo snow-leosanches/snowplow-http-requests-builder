@@ -2,9 +2,20 @@ const HISTORY_KEY_PREFIX = 'snowplow_field_history_'
 const MAX_HISTORY_ITEMS = 5
 
 /**
+ * Check if we're in a browser environment
+ */
+function isBrowser(): boolean {
+  return typeof window !== 'undefined' && typeof localStorage !== 'undefined'
+}
+
+/**
  * Get history for a specific field
  */
 export function getFieldHistory(fieldName: string): string[] {
+  if (!isBrowser()) {
+    return []
+  }
+  
   try {
     const key = `${HISTORY_KEY_PREFIX}${fieldName}`
     const stored = localStorage.getItem(key)
@@ -22,7 +33,7 @@ export function getFieldHistory(fieldName: string): string[] {
  * Add a value to field history
  */
 export function addToFieldHistory(fieldName: string, value: string): void {
-  if (!value || value.trim() === '') {
+  if (!isBrowser() || !value || value.trim() === '') {
     return
   }
 
@@ -46,6 +57,10 @@ export function addToFieldHistory(fieldName: string, value: string): void {
  * Clear history for a specific field
  */
 export function clearFieldHistory(fieldName: string): void {
+  if (!isBrowser()) {
+    return
+  }
+  
   try {
     const key = `${HISTORY_KEY_PREFIX}${fieldName}`
     localStorage.removeItem(key)
@@ -58,6 +73,10 @@ export function clearFieldHistory(fieldName: string): void {
  * Clear all field history
  */
 export function clearAllFieldHistory(): void {
+  if (!isBrowser()) {
+    return
+  }
+  
   try {
     const keys = Object.keys(localStorage)
     keys.forEach(key => {
