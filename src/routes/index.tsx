@@ -15,7 +15,14 @@ import {
 import { validateField, validateData } from '../utils/validation'
 import { getFieldHistory, addToFieldHistory } from '../utils/fieldHistory'
 import { SchemaField } from '../types/snowplow'
-import { Copy, Check, Code, FileJson, Play, Loader2, AlertCircle, Clock } from 'lucide-react'
+import { Copy, Check, Code, FileJson, Play, Loader2, AlertCircle, Clock, Search, X, RefreshCw } from 'lucide-react'
+import {
+  fetchSchemaByUri,
+  listSchemas,
+  extractSchemaBody,
+  getSchemaUri,
+  IgluSchemaRepr,
+} from '../utils/igluClient'
 
 export const Route = createFileRoute('/')({
   component: Builder,
@@ -24,6 +31,18 @@ export const Route = createFileRoute('/')({
 function Builder() {
   const [collectorUrl, setCollectorUrl] = useState('https://collector.snowplow.io/i')
   const [eventType, setEventType] = useState<EventType>('pv')
+  
+  // Iglu Server configuration
+  const [igluBaseUrl, setIgluBaseUrl] = useState('')
+  const [igluApiKey, setIgluApiKey] = useState('')
+  
+  // Schema catalog for dropdowns
+  const [availableSchemas, setAvailableSchemas] = useState<IgluSchemaRepr[]>([])
+  const [loadingSchemas, setLoadingSchemas] = useState(false)
+  const [schemaSearchQuery, setSchemaSearchQuery] = useState('')
+  const [contextSchemaSearchQueries, setContextSchemaSearchQueries] = useState<Record<number, string>>({})
+  const [showSelfDescribingSchemaDropdown, setShowSelfDescribingSchemaDropdown] = useState(false)
+  const [showContextSchemaDropdowns, setShowContextSchemaDropdowns] = useState<Record<number, boolean>>({})
   
   // Common parameters
   const [appParams, setAppParams] = useState({
@@ -456,6 +475,139 @@ function Builder() {
     setSelfDescribingData({ ...selfDescribingData, [fieldName]: value })
   }
 
+  // Load available schemas from Iglu Server
+  const loadAvailableSchemas = async () => {
+    if (!igluBaseUrl) {
+      setAvailableSchemas([])
+      return
+    }
+
+    setLoadingSchemas(true)
+    try {
+      // Try to load common vendors - you can customize this
+      // Note: This is a simplified approach. For production, you might want to
+      // implement a more comprehensive schema discovery mechanism
+      const commonVendors = ['com.snowplowanalytics.snowplow', 'com.snowplowanalytics']
+      const allSchemas: IgluSchemaRepr[] = []
+      const seenUris = new Set<string>()
+
+      for (const vendor of commonVendors) {
+        try {
+          const schemas = await listSchemas(igluBaseUrl, igluApiKey || null, vendor, undefined, 'Uri')
+          schemas.forEach(schema => {
+            const uri = getSchemaUri(schema)
+            if (uri && !seenUris.has(uri)) {
+              seenUris.add(uri)
+              allSchemas.push(schema)
+            }
+          })
+        } catch (error) {
+          // Continue with other vendors if one fails
+          console.warn(`Failed to load schemas for vendor ${vendor}:`, error)
+        }
+      }
+
+      setAvailableSchemas(allSchemas)
+    } catch (error) {
+      console.error('Failed to load schemas:', error)
+      setAvailableSchemas([])
+    } finally {
+      setLoadingSchemas(false)
+    }
+  }
+
+  // Load schemas when Iglu configuration changes
+  useEffect(() => {
+    if (igluBaseUrl) {
+      loadAvailableSchemas()
+    } else {
+      setAvailableSchemas([])
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [igluBaseUrl, igluApiKey])
+
+  // Filter schemas based on search query
+  const filteredSchemas = useMemo(() => {
+    if (!schemaSearchQuery) return availableSchemas
+    const query = schemaSearchQuery.toLowerCase()
+    return availableSchemas.filter(schema => {
+      const uri = getSchemaUri(schema)
+      return uri?.toLowerCase().includes(query)
+    })
+  }, [availableSchemas, schemaSearchQuery])
+
+  // Handle schema selection for self-describing event
+  const handleSelfDescribingSchemaSelect = async (schemaUri: string) => {
+    if (!igluBaseUrl) return
+
+    setSelfDescribingSchema(schemaUri)
+    setSchemaSearchQuery('')
+
+    try {
+      const repr = await fetchSchemaByUri(igluBaseUrl, igluApiKey || null, schemaUri, 'Canonical')
+      if (repr) {
+        const schemaBody = extractSchemaBody(repr)
+        if (schemaBody) {
+          setSelfDescribingSchemaJson(JSON.stringify(schemaBody, null, 2))
+          const fields = parseJsonSchema(schemaBody)
+          // Initialize data with empty values
+          const newData: Record<string, any> = {}
+          fields.forEach(field => {
+            newData[field.name] = ''
+          })
+          setSelfDescribingData(newData)
+        }
+      }
+    } catch (error) {
+      console.error('Failed to fetch schema:', error)
+      // Still allow manual entry
+    }
+  }
+
+  // Handle schema selection for context entity
+  const handleContextSchemaSelect = async (index: number, schemaUri: string) => {
+    if (!igluBaseUrl) return
+
+    const updated = [...contextSchemas]
+    updated[index] = { ...updated[index], schema: schemaUri }
+    setContextSchemas(updated)
+    setContextSchemaSearchQueries({ ...contextSchemaSearchQueries, [index]: '' })
+
+    try {
+      const repr = await fetchSchemaByUri(igluBaseUrl, igluApiKey || null, schemaUri, 'Canonical')
+      if (repr) {
+        const schemaBody = extractSchemaBody(repr)
+        if (schemaBody) {
+          updated[index].schemaJson = JSON.stringify(schemaBody, null, 2)
+          const fields = parseJsonSchema(schemaBody)
+          updated[index].fields = fields
+          // Initialize data with empty values
+          const newData: Record<string, any> = {}
+          fields.forEach(field => {
+            newData[field.name] = ''
+          })
+          updated[index].data = newData
+          updated[index].dataJson = JSON.stringify(newData, null, 2)
+          setContextSchemas(updated)
+        }
+      }
+    } catch (error) {
+      console.error('Failed to fetch schema:', error)
+      // Still allow manual entry
+    }
+  }
+
+  // Filter context schemas based on search query
+  const getFilteredContextSchemas = (index: number) => {
+    const query = contextSchemaSearchQueries[index] || ''
+    if (!query) return availableSchemas
+    const lowerQuery = query.toLowerCase()
+    return availableSchemas.filter(schema => {
+      const uri = getSchemaUri(schema)
+      return uri?.toLowerCase().includes(lowerQuery)
+    })
+  }
+
   return (
     <div className="min-h-screen bg-gradient-to-b from-slate-900 via-slate-800 to-slate-900 p-6">
       <div className="max-w-7xl mx-auto">
@@ -469,6 +621,66 @@ function Builder() {
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           {/* Left Column - Form */}
           <div className="space-y-6">
+            {/* Iglu Server Configuration */}
+            <FormSection title="Iglu Server Configuration (optional)">
+              <div className="space-y-4">
+                <FormField
+                  label="Iglu Server Base URL"
+                  value={igluBaseUrl}
+                  onChange={(v) => {
+                    setIgluBaseUrl(v)
+                    addToFieldHistory('igluBaseUrl', v)
+                  }}
+                  placeholder="https://com-myserver-dev.iglu.snplow.net"
+                  fieldName="igluBaseUrl"
+                />
+                <FormField
+                  label="API Key (optional)"
+                  value={igluApiKey}
+                  onChange={(v) => {
+                    setIgluApiKey(v)
+                    addToFieldHistory('igluApiKey', v)
+                  }}
+                  placeholder="Enter your Iglu API key"
+                  fieldName="igluApiKey"
+                  type="text"
+                />
+                <div className="flex items-center justify-between gap-4">
+                  <div className="flex-1">
+                    {loadingSchemas && (
+                      <div className="flex items-center gap-2 text-sm text-gray-400">
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                        Loading schemas...
+                      </div>
+                    )}
+                    {igluBaseUrl && !loadingSchemas && availableSchemas.length > 0 && (
+                      <div className="text-sm text-green-400">
+                        Loaded {availableSchemas.length} schemas
+                      </div>
+                    )}
+                    {igluBaseUrl && !loadingSchemas && availableSchemas.length === 0 && (
+                      <div className="text-sm text-gray-400">
+                        No schemas loaded. Click Refresh to load schemas.
+                      </div>
+                    )}
+                  </div>
+                  <button
+                    onClick={loadAvailableSchemas}
+                    disabled={!igluBaseUrl || loadingSchemas}
+                    className="flex items-center gap-2 px-4 py-2 bg-cyan-600 hover:bg-cyan-700 disabled:bg-slate-700 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg transition-colors"
+                    title={!igluBaseUrl ? 'Enter Iglu Server Base URL first' : 'Refresh schemas from Iglu Server'}
+                  >
+                    {loadingSchemas ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <RefreshCw className="w-4 h-4" />
+                    )}
+                    Refresh
+                  </button>
+                </div>
+              </div>
+            </FormSection>
+
             {/* Collector URL */}
             <FormSection title="Collector URL">
               <FormField
@@ -892,13 +1104,115 @@ function Builder() {
             {eventType === 'ue' && (
               <FormSection title="Self-describing Event">
                 <div className="space-y-4">
-                  <FormField
-                    label="Schema URI"
-                    value={selfDescribingSchema}
-                    onChange={(v) => setSelfDescribingSchema(v)}
-                    placeholder="iglu:com.snowplowanalytics.snowplow/page_view/jsonschema/1-0-0"
-                    fieldName="selfDescribingSchema"
-                  />
+                  {/* Schema Selection from Iglu */}
+                  {igluBaseUrl && availableSchemas.length > 0 && (
+                    <div>
+                      <label className="block text-sm font-medium text-gray-300 mb-2">
+                        Select Schema from Iglu Catalog
+                      </label>
+                      <div className="relative">
+                        <div className="relative">
+                          <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 w-4 h-4" />
+                          <input
+                            type="text"
+                            value={schemaSearchQuery}
+                            onChange={(e) => setSchemaSearchQuery(e.target.value)}
+                            onFocus={() => setSchemaSearchQuery('')}
+                            placeholder="Search schemas..."
+                            className="w-full pl-10 pr-10 py-2 bg-slate-900 border border-slate-700 rounded-lg text-white focus:outline-none focus:border-cyan-500"
+                          />
+                          {schemaSearchQuery && (
+                            <button
+                              onClick={() => setSchemaSearchQuery('')}
+                              className="absolute right-3 top-1/2 transform -translate-y-1/2 text-gray-400 hover:text-white"
+                            >
+                              <X className="w-4 h-4" />
+                            </button>
+                          )}
+                        </div>
+                        {schemaSearchQuery && filteredSchemas.length > 0 && (
+                          <div className="absolute z-20 w-full mt-1 bg-slate-800 border border-slate-700 rounded-lg shadow-lg max-h-64 overflow-y-auto">
+                            {filteredSchemas.map((schema, idx) => {
+                              const uri = getSchemaUri(schema)
+                              if (!uri) return null
+                              return (
+                                <button
+                                  key={idx}
+                                  type="button"
+                                  onMouseDown={(e) => {
+                                    e.preventDefault()
+                                    handleSelfDescribingSchemaSelect(uri)
+                                  }}
+                                  className="w-full text-left px-3 py-2 text-sm text-white hover:bg-slate-700 transition-colors border-b border-slate-700 last:border-b-0"
+                                >
+                                  <div className="font-mono text-xs">{uri}</div>
+                                </button>
+                              )
+                            })}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                  
+                  {/* Schema URI with Iglu dropdown */}
+                  {igluBaseUrl && availableSchemas.length > 0 ? (
+                    <div>
+                      <label className="block text-sm font-medium text-gray-300 mb-1">
+                        Schema URI
+                      </label>
+                      <div className="relative">
+                        <input
+                          type="text"
+                          value={selfDescribingSchema}
+                          onChange={(e) => setSelfDescribingSchema(e.target.value)}
+                          onFocus={() => setShowSelfDescribingSchemaDropdown(true)}
+                          onBlur={() => {
+                            setTimeout(() => setShowSelfDescribingSchemaDropdown(false), 200)
+                            if (selfDescribingSchema.trim() !== '') {
+                              addToFieldHistory('selfDescribingSchema', selfDescribingSchema)
+                            }
+                          }}
+                          placeholder="iglu:com.snowplowanalytics.snowplow/page_view/jsonschema/1-0-0"
+                          className="w-full px-4 py-2 bg-slate-900 border border-slate-700 rounded-lg text-white focus:outline-none focus:border-cyan-500"
+                        />
+                        {showSelfDescribingSchemaDropdown && availableSchemas.length > 0 && (
+                          <div className="absolute z-20 w-full mt-1 bg-slate-800 border border-slate-700 rounded-lg shadow-lg max-h-64 overflow-y-auto">
+                            <div className="p-2 text-xs text-gray-400 border-b border-slate-700 flex items-center gap-1">
+                              <Search className="w-3 h-3" />
+                              Available schemas ({availableSchemas.length})
+                            </div>
+                            {availableSchemas.map((schema, idx) => {
+                              const uri = getSchemaUri(schema)
+                              if (!uri) return null
+                              return (
+                                <button
+                                  key={idx}
+                                  type="button"
+                                  onMouseDown={(e) => {
+                                    e.preventDefault()
+                                    handleSelfDescribingSchemaSelect(uri)
+                                    setShowSelfDescribingSchemaDropdown(false)
+                                  }}
+                                  className="w-full text-left px-3 py-2 text-sm text-white hover:bg-slate-700 transition-colors border-b border-slate-700 last:border-b-0"
+                                >
+                                  <div className="font-mono text-xs">{uri}</div>
+                                </button>
+                              )
+                            })}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  ) : (
+                    <FormField
+                      label="Schema URI"
+                      value={selfDescribingSchema}
+                      onChange={(v) => setSelfDescribingSchema(v)}
+                      placeholder="iglu:com.snowplowanalytics.snowplow/page_view/jsonschema/1-0-0"
+                      fieldName="selfDescribingSchema"
+                    />
+                  )}
                   <div>
                     <label className="block text-sm font-medium text-gray-300 mb-2">
                       JSON Schema (for dynamic form generation)
@@ -978,13 +1292,117 @@ function Builder() {
                       </button>
                     </div>
                     <div className="space-y-4">
-                      <FormField
-                        label="Schema URI"
-                        value={ctx.schema}
-                        onChange={(v) => updateContextEntity(index, 'schema', v)}
-                        placeholder="iglu:com.snowplowanalytics.snowplow/web_page/jsonschema/1-0-0"
-                        fieldName={`context_schema_${index}`}
-                      />
+                      {/* Schema Selection from Iglu */}
+                      {igluBaseUrl && availableSchemas.length > 0 && (
+                        <div>
+                          <label className="block text-sm font-medium text-gray-300 mb-2">
+                            Select Schema from Iglu Catalog
+                          </label>
+                          <div className="relative">
+                            <div className="relative">
+                              <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 w-4 h-4" />
+                              <input
+                                type="text"
+                                value={contextSchemaSearchQueries[index] || ''}
+                                onChange={(e) => setContextSchemaSearchQueries({ ...contextSchemaSearchQueries, [index]: e.target.value })}
+                                onFocus={() => setContextSchemaSearchQueries({ ...contextSchemaSearchQueries, [index]: '' })}
+                                placeholder="Search schemas..."
+                                className="w-full pl-10 pr-10 py-2 bg-slate-900 border border-slate-700 rounded-lg text-white focus:outline-none focus:border-cyan-500"
+                              />
+                              {contextSchemaSearchQueries[index] && (
+                                <button
+                                  onClick={() => setContextSchemaSearchQueries({ ...contextSchemaSearchQueries, [index]: '' })}
+                                  className="absolute right-3 top-1/2 transform -translate-y-1/2 text-gray-400 hover:text-white"
+                                >
+                                  <X className="w-4 h-4" />
+                                </button>
+                              )}
+                            </div>
+                            {contextSchemaSearchQueries[index] && getFilteredContextSchemas(index).length > 0 && (
+                              <div className="absolute z-20 w-full mt-1 bg-slate-800 border border-slate-700 rounded-lg shadow-lg max-h-64 overflow-y-auto">
+                                {getFilteredContextSchemas(index).map((schema, idx) => {
+                                  const uri = getSchemaUri(schema)
+                                  if (!uri) return null
+                                  return (
+                                    <button
+                                      key={idx}
+                                      type="button"
+                                      onMouseDown={(e) => {
+                                        e.preventDefault()
+                                        handleContextSchemaSelect(index, uri)
+                                      }}
+                                      className="w-full text-left px-3 py-2 text-sm text-white hover:bg-slate-700 transition-colors border-b border-slate-700 last:border-b-0"
+                                    >
+                                      <div className="font-mono text-xs">{uri}</div>
+                                    </button>
+                                  )
+                                })}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      )}
+                      
+                      {/* Schema URI with Iglu dropdown */}
+                      {igluBaseUrl && availableSchemas.length > 0 ? (
+                        <div>
+                          <label className="block text-sm font-medium text-gray-300 mb-1">
+                            Schema URI
+                          </label>
+                          <div className="relative">
+                            <input
+                              type="text"
+                              value={ctx.schema}
+                              onChange={(e) => updateContextEntity(index, 'schema', e.target.value)}
+                              onFocus={() => setShowContextSchemaDropdowns({ ...showContextSchemaDropdowns, [index]: true })}
+                              onBlur={() => {
+                                setTimeout(() => {
+                                  setShowContextSchemaDropdowns({ ...showContextSchemaDropdowns, [index]: false })
+                                }, 200)
+                                if (ctx.schema.trim() !== '') {
+                                  addToFieldHistory(`context_schema_${index}`, ctx.schema)
+                                }
+                              }}
+                              placeholder="iglu:com.snowplowanalytics.snowplow/web_page/jsonschema/1-0-0"
+                              className="w-full px-4 py-2 bg-slate-900 border border-slate-700 rounded-lg text-white focus:outline-none focus:border-cyan-500"
+                            />
+                            {showContextSchemaDropdowns[index] && availableSchemas.length > 0 && (
+                              <div className="absolute z-20 w-full mt-1 bg-slate-800 border border-slate-700 rounded-lg shadow-lg max-h-64 overflow-y-auto">
+                                <div className="p-2 text-xs text-gray-400 border-b border-slate-700 flex items-center gap-1">
+                                  <Search className="w-3 h-3" />
+                                  Available schemas ({availableSchemas.length})
+                                </div>
+                                {availableSchemas.map((schema, idx) => {
+                                  const uri = getSchemaUri(schema)
+                                  if (!uri) return null
+                                  return (
+                                    <button
+                                      key={idx}
+                                      type="button"
+                                      onMouseDown={(e) => {
+                                        e.preventDefault()
+                                        handleContextSchemaSelect(index, uri)
+                                        setShowContextSchemaDropdowns({ ...showContextSchemaDropdowns, [index]: false })
+                                      }}
+                                      className="w-full text-left px-3 py-2 text-sm text-white hover:bg-slate-700 transition-colors border-b border-slate-700 last:border-b-0"
+                                    >
+                                      <div className="font-mono text-xs">{uri}</div>
+                                    </button>
+                                  )
+                                })}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      ) : (
+                        <FormField
+                          label="Schema URI"
+                          value={ctx.schema}
+                          onChange={(v) => updateContextEntity(index, 'schema', v)}
+                          placeholder="iglu:com.snowplowanalytics.snowplow/web_page/jsonschema/1-0-0"
+                          fieldName={`context_schema_${index}`}
+                        />
+                      )}
                       <div>
                         <label className="block text-sm font-medium text-gray-300 mb-2">
                           JSON Schema (for dynamic form generation)
@@ -1208,12 +1626,13 @@ function FormField({
 
   const handleChange = (newValue: string) => {
     onChange(newValue)
-    if (fieldName && newValue.trim() !== '') {
-      addToFieldHistory(fieldName, newValue)
-    }
   }
 
   const handleBlur = () => {
+    // Save to history only on blur
+    if (fieldName && value.trim() !== '') {
+      addToFieldHistory(fieldName, value)
+    }
     // Delay hiding history to allow clicking on items
     setTimeout(() => setShowHistory(false), 200)
   }
