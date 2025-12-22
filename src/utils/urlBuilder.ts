@@ -103,8 +103,11 @@ export function buildSnowplowUrl(
   if (request.selfDescribingEvent && request.selfDescribingEvent.schema) {
     try {
       const uePr = {
-        schema: request.selfDescribingEvent.schema,
-        data: request.selfDescribingEvent.data,
+        schema: 'iglu:com.snowplowanalytics.snowplow/unstruct_event/jsonschema/1-0-0',
+        data: {
+          schema: request.selfDescribingEvent.schema,
+          data: request.selfDescribingEvent.data,
+        },
       }
       const jsonString = JSON.stringify(uePr)
       // Base64 encode the JSON string
@@ -124,7 +127,11 @@ export function buildSnowplowUrl(
           data: ctx.data,
         }))
       if (contexts.length > 0) {
-        const jsonString = JSON.stringify(contexts)
+        const cxPayload = {
+          schema: 'iglu:com.snowplowanalytics.snowplow/contexts/jsonschema/1-0-0',
+          data: contexts,
+        }
+        const jsonString = JSON.stringify(cxPayload)
         // Base64 encode the JSON string
         params.append('cx', btoa(jsonString))
       }
