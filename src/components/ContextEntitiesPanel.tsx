@@ -1,9 +1,9 @@
 import { DynamicFormField } from "@/helpers/DynamicFormField"
-import { FormField } from "@/helpers/FormField"
 import { FormSection } from "@/helpers/FormSection"
 import { SchemaField } from "@/types/snowplow"
 import { addToFieldHistory } from "@/utils/fieldHistory"
-import { getSchemaUri, IgluSchemaRepr } from "@/utils/igluClient"
+import { getSchemaUriFromDataStructure } from "@/utils/snowplowDataStructuresClient"
+import type { DataStructure } from "@/types/snowplowDataStructures"
 import { Search, X } from "lucide-react"
 
 export interface ContextEntitiesPanelProps {
@@ -24,12 +24,10 @@ export interface ContextEntitiesPanelProps {
     errors: Record<string, string>
   }>) => void
   removeContextEntity: (index: number) => void
-  igluBaseUrl: string
-  availableSchemas: IgluSchemaRepr[]
+  organizationId: string
+  availableSchemas: DataStructure[]
   contextSchemaSearchQueries: Record<number, string>
   setContextSchemaSearchQueries: (contextSchemaSearchQueries: Record<number, string>) => void
-  filteredContextSchemas: IgluSchemaRepr[]
-  getFilteredContextSchemas: (index: number) => IgluSchemaRepr[]
   handleContextSchemaSelect: (index: number, uri: string) => void
   updateContextEntity: (index: number, field: string, value: any) => void
   updateContextEntityData: (index: number, fieldName: string, value: any) => void
@@ -39,9 +37,9 @@ export interface ContextEntitiesPanelProps {
 }
 
 export const ContextEntitiesPanel = ({
-  contextSchemas, removeContextEntity, igluBaseUrl, availableSchemas,
+  contextSchemas, removeContextEntity, organizationId, availableSchemas,
   contextSchemaSearchQueries, setContextSchemaSearchQueries,
-  getFilteredContextSchemas, handleContextSchemaSelect,
+  handleContextSchemaSelect,
   updateContextEntity, updateContextEntityData, addContextEntity,
   showContextSchemaDropdowns, setShowContextSchemaDropdowns
 }: ContextEntitiesPanelProps) => {
@@ -59,117 +57,113 @@ export const ContextEntitiesPanel = ({
             </button>
           </div>
           <div className="space-y-4">
-            {/* Schema Selection from Iglu */}
-            {igluBaseUrl && availableSchemas.length > 0 && (
-              <div>
-                <label className="block text-sm font-medium text-gray-300 mb-2">
-                  Select Schema from Iglu Catalog
-                </label>
-                <div className="relative">
-                  <div className="relative">
-                    <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 w-4 h-4" />
-                    <input
-                      type="text"
-                      value={contextSchemaSearchQueries[index] || ''}
-                      onChange={(e) => setContextSchemaSearchQueries({ ...contextSchemaSearchQueries, [index]: e.target.value })}
-                      onFocus={() => setContextSchemaSearchQueries({ ...contextSchemaSearchQueries, [index]: '' })}
-                      placeholder="Search schemas..."
-                      className="w-full pl-10 pr-10 py-2 bg-slate-900 border border-slate-700 rounded-lg text-white focus:outline-none focus:border-cyan-500"
-                    />
-                    {contextSchemaSearchQueries[index] && (
-                      <button
-                        onClick={() => setContextSchemaSearchQueries({ ...contextSchemaSearchQueries, [index]: '' })}
-                        className="absolute right-3 top-1/2 transform -translate-y-1/2 text-gray-400 hover:text-white"
-                      >
-                        <X className="w-4 h-4" />
-                      </button>
-                    )}
-                  </div>
-                  {contextSchemaSearchQueries[index] && getFilteredContextSchemas(index).length > 0 && (
-                    <div className="absolute z-20 w-full mt-1 bg-slate-800 border border-slate-700 rounded-lg shadow-lg max-h-64 overflow-y-auto">
-                      {getFilteredContextSchemas(index).map((schema, idx) => {
-                        const uri = getSchemaUri(schema)
-                        if (!uri) return null
-                        return (
-                          <button
-                            key={idx}
-                            type="button"
-                            onMouseDown={(e) => {
-                              e.preventDefault()
-                              handleContextSchemaSelect(index, uri)
-                            }}
-                            className="w-full text-left px-3 py-2 text-sm text-white hover:bg-slate-700 transition-colors border-b border-slate-700 last:border-b-0"
-                          >
-                            <div className="font-mono text-xs">{uri}</div>
-                          </button>
-                        )
-                      })}
-                    </div>
-                  )}
-                </div>
-              </div>
-            )}
-
-            {/* Schema URI with Iglu dropdown */}
-            {igluBaseUrl && availableSchemas.length > 0 ? (
-              <div>
-                <label className="block text-sm font-medium text-gray-300 mb-1">
-                  Schema URI
-                </label>
-                <div className="relative">
-                  <input
-                    type="text"
-                    value={ctx.schema}
-                    onChange={(e) => updateContextEntity(index, 'schema', e.target.value)}
-                    onFocus={() => setShowContextSchemaDropdowns({ ...showContextSchemaDropdowns, [index]: true })}
-                    onBlur={() => {
-                      setTimeout(() => {
-                        setShowContextSchemaDropdowns({ ...showContextSchemaDropdowns, [index]: false })
-                      }, 200)
-                      if (ctx.schema.trim() !== '') {
-                        addToFieldHistory(`context_schema_${index}`, ctx.schema)
-                      }
+            {/* Schema URI with searchable autocomplete */}
+            <div>
+              <label className="block text-sm font-medium text-gray-300 mb-1">
+                Schema URI
+              </label>
+              <div className="relative">
+                <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 w-4 h-4" />
+                <input
+                  type="text"
+                  value={ctx.schema}
+                  onChange={(e) => {
+                    updateContextEntity(index, 'schema', e.target.value)
+                    // Update search query for filtering
+                    setContextSchemaSearchQueries({ ...contextSchemaSearchQueries, [index]: e.target.value })
+                  }}
+                  onFocus={() => {
+                    setShowContextSchemaDropdowns({ ...showContextSchemaDropdowns, [index]: true })
+                    // Initialize search query with current schema value for filtering
+                    if (!contextSchemaSearchQueries[index]) {
+                      setContextSchemaSearchQueries({ ...contextSchemaSearchQueries, [index]: ctx.schema })
+                    }
+                  }}
+                  onBlur={() => {
+                    setTimeout(() => {
+                      setShowContextSchemaDropdowns({ ...showContextSchemaDropdowns, [index]: false })
+                    }, 200)
+                    if (ctx.schema.trim() !== '') {
+                      addToFieldHistory(`context_schema_${index}`, ctx.schema)
+                    }
+                  }}
+                  placeholder="Search or type schema URI (e.g., iglu:com.snowplowanalytics.snowplow/web_page/jsonschema/1-0-0)"
+                  className="w-full pl-10 pr-10 py-2 bg-slate-900 border border-slate-700 rounded-lg text-white focus:outline-none focus:border-cyan-500"
+                />
+                {ctx.schema && (
+                  <button
+                    onClick={() => {
+                      updateContextEntity(index, 'schema', '')
+                      setContextSchemaSearchQueries({ ...contextSchemaSearchQueries, [index]: '' })
                     }}
-                    placeholder="iglu:com.snowplowanalytics.snowplow/web_page/jsonschema/1-0-0"
-                    className="w-full px-4 py-2 bg-slate-900 border border-slate-700 rounded-lg text-white focus:outline-none focus:border-cyan-500"
-                  />
-                  {showContextSchemaDropdowns[index] && availableSchemas.length > 0 && (
-                    <div className="absolute z-20 w-full mt-1 bg-slate-800 border border-slate-700 rounded-lg shadow-lg max-h-64 overflow-y-auto">
-                      <div className="p-2 text-xs text-gray-400 border-b border-slate-700 flex items-center gap-1">
-                        <Search className="w-3 h-3" />
-                        Available schemas ({availableSchemas.length})
-                      </div>
-                      {availableSchemas.map((schema, idx) => {
-                        const uri = getSchemaUri(schema)
-                        if (!uri) return null
+                    className="absolute right-3 top-1/2 transform -translate-y-1/2 text-gray-400 hover:text-white"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                )}
+                {showContextSchemaDropdowns[index] && organizationId && availableSchemas.length > 0 && (
+                  <div className="absolute z-20 w-full mt-1 bg-slate-800 border border-slate-700 rounded-lg shadow-lg max-h-64 overflow-y-auto">
+                    {(() => {
+                      const searchQuery = ctx.schema || ''
+                      const lowerQuery = searchQuery.toLowerCase()
+                      
+                      // Filter schemas based on search query
+                      const filtered = searchQuery
+                        ? availableSchemas.filter(schema => {
+                            const uri = getSchemaUriFromDataStructure(schema)
+                            if (!uri) return false
+                            return uri.toLowerCase().includes(lowerQuery) ||
+                              schema.name.toLowerCase().includes(lowerQuery) ||
+                              schema.vendor.toLowerCase().includes(lowerQuery) ||
+                              (schema.description && schema.description.toLowerCase().includes(lowerQuery))
+                          })
+                        : availableSchemas.slice(0, 5) // Show first 5 when empty
+                      
+                      if (filtered.length === 0) {
                         return (
-                          <button
-                            key={idx}
-                            type="button"
-                            onMouseDown={(e) => {
-                              e.preventDefault()
-                              handleContextSchemaSelect(index, uri)
-                              setShowContextSchemaDropdowns({ ...showContextSchemaDropdowns, [index]: false })
-                            }}
-                            className="w-full text-left px-3 py-2 text-sm text-white hover:bg-slate-700 transition-colors border-b border-slate-700 last:border-b-0"
-                          >
-                            <div className="font-mono text-xs">{uri}</div>
-                          </button>
+                          <div className="p-3 text-sm text-gray-400 text-center">
+                            No schemas found matching "{searchQuery}"
+                          </div>
                         )
-                      })}
-                    </div>
-                  )}
-                </div>
+                      }
+                      
+                      return (
+                        <>
+                          <div className="p-2 text-xs text-gray-400 border-b border-slate-700 flex items-center gap-1">
+                            <Search className="w-3 h-3" />
+                            {searchQuery 
+                              ? `Found ${filtered.length} schema${filtered.length !== 1 ? 's' : ''}`
+                              : `Showing first 5 of ${availableSchemas.length} schemas`
+                            }
+                          </div>
+                          {filtered.map((schema, idx) => {
+                            const uri = getSchemaUriFromDataStructure(schema)
+                            if (!uri) return null
+                            return (
+                              <button
+                                key={idx}
+                                type="button"
+                                onMouseDown={(e) => {
+                                  e.preventDefault()
+                                  handleContextSchemaSelect(index, uri)
+                                  setShowContextSchemaDropdowns({ ...showContextSchemaDropdowns, [index]: false })
+                                }}
+                                className="w-full text-left px-3 py-2 text-sm text-white hover:bg-slate-700 transition-colors border-b border-slate-700 last:border-b-0"
+                              >
+                                <div className="font-mono text-xs">{uri}</div>
+                                {schema.description && (
+                                  <div className="text-xs text-gray-400 mt-1">{schema.description}</div>
+                                )}
+                              </button>
+                            )
+                          })}
+                        </>
+                      )
+                    })()}
+                  </div>
+                )}
               </div>
-            ) : (
-              <FormField
-                label="Schema URI"
-                value={ctx.schema}
-                onChange={(v) => updateContextEntity(index, 'schema', v)}
-                placeholder="iglu:com.snowplowanalytics.snowplow/web_page/jsonschema/1-0-0"
-                fieldName={`context_schema_${index}`}
-              />
-            )}
+            </div>
             <div>
               <label className="block text-sm font-medium text-gray-300 mb-2">
                 JSON Schema (for dynamic form generation)

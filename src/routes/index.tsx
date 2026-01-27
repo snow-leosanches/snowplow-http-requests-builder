@@ -22,13 +22,12 @@ import { validateField, validateData } from '../utils/validation'
 import { SchemaField } from '../types/snowplow'
 
 import {
-  fetchSchemaByUri,
-  listSchemas,
-  extractSchemaBody,
-  getSchemaUri,
-  IgluSchemaRepr,
-} from '../utils/igluClient'
-import { IgluConfigurationPanel } from '@/components/IgluConfigurationPanel'
+  listDataStructures,
+  fetchSchemaContent,
+  getSchemaUriFromDataStructure,
+} from '../utils/snowplowDataStructuresClient'
+import type { DataStructure } from '../types/snowplowDataStructures'
+import { SnowplowConfigurationPanel } from '@/components/SnowplowConfigurationPanel'
 import { FormSection } from '@/helpers/FormSection'
 import { CollectorInformationPanel } from '@/components/CollectorInformationPanel'
 import { ApplicationParametersPanel } from '@/components/ApplicationParametersPanel'
@@ -52,12 +51,13 @@ function Builder() {
   const [collectorUrl, setCollectorUrl] = useState('https://collector.snowplow.io/i')
   const [eventType, setEventType] = useState<EventType>('pv')
   
-  // Iglu Server configuration
-  const [igluBaseUrl, setIgluBaseUrl] = useState('')
-  const [igluApiKey, setIgluApiKey] = useState('')
+  // Snowplow Data Structures configuration
+  const [organizationId, setOrganizationId] = useState('')
+  const [apiKey, setApiKey] = useState('')
+  const [apiKeyId, setApiKeyId] = useState('')
   
   // Schema catalog for dropdowns
-  const [availableSchemas, setAvailableSchemas] = useState<IgluSchemaRepr[]>([])
+  const [availableSchemas, setAvailableSchemas] = useState<DataStructure[]>([])
   const [loadingSchemas, setLoadingSchemas] = useState(false)
   const [schemaSearchQuery, setSchemaSearchQuery] = useState('')
   const [contextSchemaSearchQueries, setContextSchemaSearchQueries] = useState<Record<number, string>>({})
@@ -440,81 +440,79 @@ function Builder() {
     setSelfDescribingData({ ...selfDescribingData, [fieldName]: value })
   }
 
-  // Load available schemas from Iglu Server
+  // Load available schemas from Snowplow Data Structures API
   const loadAvailableSchemas = async () => {
-    if (!igluBaseUrl) {
+    if (!organizationId || !apiKey || !apiKeyId) {
       setAvailableSchemas([])
       return
     }
 
     setLoadingSchemas(true)
     try {
-      // Try to load common vendors - you can customize this
-      // Note: This is a simplified approach. For production, you might want to
-      // implement a more comprehensive schema discovery mechanism
-      const commonVendors = ['com.snowplowanalytics.snowplow', 'com.snowplowanalytics']
-      const allSchemas: IgluSchemaRepr[] = []
-      const seenUris = new Set<string>()
-
-      for (const vendor of commonVendors) {
-        try {
-          const schemas = await listSchemas(igluBaseUrl, igluApiKey || null, vendor, undefined, 'Uri')
-          schemas.forEach(schema => {
-            const uri = getSchemaUri(schema)
-            if (uri && !seenUris.has(uri)) {
-              seenUris.add(uri)
-              allSchemas.push(schema)
-            }
-          })
-        } catch (error) {
-          // Continue with other vendors if one fails
-          console.warn(`Failed to load schemas for vendor ${vendor}:`, error)
-        }
-      }
-
-      setAvailableSchemas(allSchemas)
+      const dataStructures = await listDataStructures(organizationId, apiKey, apiKeyId, {
+        format: 'jsonschema',
+        size: 100, // Adjust as needed
+      })
+      setAvailableSchemas(dataStructures)
     } catch (error) {
-      console.error('Failed to load schemas:', error)
+      console.error('Failed to load data structures:', error)
       setAvailableSchemas([])
     } finally {
       setLoadingSchemas(false)
     }
   }
 
-  // Load schemas when Iglu configuration changes
+  // Load schemas when Snowplow configuration changes
   useEffect(() => {
-    if (igluBaseUrl) {
+    if (organizationId && apiKey && apiKeyId) {
       loadAvailableSchemas()
     } else {
       setAvailableSchemas([])
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [igluBaseUrl, igluApiKey])
+  }, [organizationId, apiKey, apiKeyId])
 
   // Filter schemas based on search query
   const filteredSchemas = useMemo(() => {
     if (!schemaSearchQuery) return availableSchemas
     const query = schemaSearchQuery.toLowerCase()
     return availableSchemas.filter(schema => {
-      const uri = getSchemaUri(schema)
-      return uri?.toLowerCase().includes(query)
+      const uri = getSchemaUriFromDataStructure(schema)
+      return uri?.toLowerCase().includes(query) ||
+        schema.name.toLowerCase().includes(query) ||
+        schema.vendor.toLowerCase().includes(query)
     })
   }, [availableSchemas, schemaSearchQuery])
 
   // Handle schema selection for self-describing event
   const handleSelfDescribingSchemaSelect = async (schemaUri: string) => {
-    if (!igluBaseUrl) return
+    if (!organizationId || !apiKey || !apiKeyId) return
 
     setSelfDescribingSchema(schemaUri)
     setSchemaSearchQuery('')
 
     try {
-      const repr = await fetchSchemaByUri(igluBaseUrl, igluApiKey || null, schemaUri, 'Canonical')
-      if (repr) {
-        const schemaBody = extractSchemaBody(repr)
-        if (schemaBody) {
-          setSelfDescribingSchemaJson(JSON.stringify(schemaBody, null, 2))
-          const fields = parseJsonSchema(schemaBody)
+      // Find the data structure by URI
+      const dataStructure = availableSchemas.find(ds => {
+        const uri = getSchemaUriFromDataStructure(ds)
+        return uri === schemaUri
+      })
+
+      if (dataStructure && dataStructure.deployments.length > 0) {
+        // Use the first deployment (prefer PROD if available)
+        const deployment = dataStructure.deployments.find(d => d.env === 'PROD') || dataStructure.deployments[0]
+        const schemaContent = await fetchSchemaContent(
+          organizationId,
+          apiKey,
+          apiKeyId,
+          dataStructure.hash,
+          deployment.version,
+          deployment.env
+        )
+        
+        if (schemaContent) {
+          setSelfDescribingSchemaJson(JSON.stringify(schemaContent, null, 2))
+          const fields = parseJsonSchema(schemaContent)
           // Initialize data with empty values
           const newData: Record<string, any> = {}
           fields.forEach(field => {
@@ -531,7 +529,7 @@ function Builder() {
 
   // Handle schema selection for context entity
   const handleContextSchemaSelect = async (index: number, schemaUri: string) => {
-    if (!igluBaseUrl) return
+    if (!organizationId || !apiKey || !apiKeyId) return
 
     const updated = [...contextSchemas]
     updated[index] = { ...updated[index], schema: schemaUri }
@@ -539,12 +537,27 @@ function Builder() {
     setContextSchemaSearchQueries({ ...contextSchemaSearchQueries, [index]: '' })
 
     try {
-      const repr = await fetchSchemaByUri(igluBaseUrl, igluApiKey || null, schemaUri, 'Canonical')
-      if (repr) {
-        const schemaBody = extractSchemaBody(repr)
-        if (schemaBody) {
-          updated[index].schemaJson = JSON.stringify(schemaBody, null, 2)
-          const fields = parseJsonSchema(schemaBody)
+      // Find the data structure by URI
+      const dataStructure = availableSchemas.find(ds => {
+        const uri = getSchemaUriFromDataStructure(ds)
+        return uri === schemaUri
+      })
+
+      if (dataStructure && dataStructure.deployments.length > 0) {
+        // Use the first deployment (prefer PROD if available)
+        const deployment = dataStructure.deployments.find(d => d.env === 'PROD') || dataStructure.deployments[0]
+        const schemaContent = await fetchSchemaContent(
+          organizationId,
+          apiKey,
+          apiKeyId,
+          dataStructure.hash,
+          deployment.version,
+          deployment.env
+        )
+        
+        if (schemaContent) {
+          updated[index].schemaJson = JSON.stringify(schemaContent, null, 2)
+          const fields = parseJsonSchema(schemaContent)
           updated[index].fields = fields
           // Initialize data with empty values
           const newData: Record<string, any> = {}
@@ -562,16 +575,6 @@ function Builder() {
     }
   }
 
-  // Filter context schemas based on search query
-  const getFilteredContextSchemas = (index: number) => {
-    const query = contextSchemaSearchQueries[index] || ''
-    if (!query) return availableSchemas
-    const lowerQuery = query.toLowerCase()
-    return availableSchemas.filter(schema => {
-      const uri = getSchemaUri(schema)
-      return uri?.toLowerCase().includes(lowerQuery)
-    })
-  }
 
   return (
     <div className="min-h-screen bg-gradient-to-b from-slate-900 via-slate-800 to-slate-900 p-6">
@@ -586,12 +589,14 @@ function Builder() {
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           {/* Left Column - Form */}
           <div className="space-y-6">
-            {/* Iglu Server Configuration */}
-            <IgluConfigurationPanel 
-              igluBaseUrl={igluBaseUrl} 
-              setIgluBaseUrl={setIgluBaseUrl} 
-              igluApiKey={igluApiKey} 
-              setIgluApiKey={setIgluApiKey} 
+            {/* Snowplow Data Structures Configuration */}
+            <SnowplowConfigurationPanel 
+              organizationId={organizationId} 
+              setOrganizationId={setOrganizationId} 
+              apiKey={apiKey} 
+              setApiKey={setApiKey}
+              apiKeyId={apiKeyId}
+              setApiKeyId={setApiKeyId}
               loadingSchemas={loadingSchemas}
               availableSchemas={availableSchemas} 
               loadAvailableSchemas={loadAvailableSchemas}
@@ -657,7 +662,7 @@ function Builder() {
             {/* Self-describing Event */}
             {eventType === 'ue' && (
               <SelfDescribingEventPanel
-                igluBaseUrl={igluBaseUrl}
+                organizationId={organizationId}
                 availableSchemas={availableSchemas}
                 schemaSearchQuery={schemaSearchQuery}
                 setSchemaSearchQuery={setSchemaSearchQuery}
@@ -681,12 +686,10 @@ function Builder() {
               contextSchemas={contextSchemas}
               setContextSchemas={setContextSchemas}
               removeContextEntity={removeContextEntity}
-              igluBaseUrl={igluBaseUrl}
+              organizationId={organizationId}
               availableSchemas={availableSchemas}
               contextSchemaSearchQueries={contextSchemaSearchQueries}
               setContextSchemaSearchQueries={setContextSchemaSearchQueries}
-              filteredContextSchemas={availableSchemas}
-              getFilteredContextSchemas={getFilteredContextSchemas}
               handleContextSchemaSelect={handleContextSchemaSelect}
               updateContextEntity={(index, field, value) => {
                 if (field === 'schema' || field === 'schemaJson' || field === 'dataJson') {

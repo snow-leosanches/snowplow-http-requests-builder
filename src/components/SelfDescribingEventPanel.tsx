@@ -3,16 +3,17 @@ import { FormField } from "@/helpers/FormField"
 import { FormSection } from "@/helpers/FormSection"
 import { SchemaField } from "@/types/snowplow"
 import { addToFieldHistory } from "@/utils/fieldHistory"
-import { getSchemaUri, IgluSchemaRepr } from "@/utils/igluClient"
+import { getSchemaUriFromDataStructure } from "@/utils/snowplowDataStructuresClient"
+import type { DataStructure } from "@/types/snowplowDataStructures"
 import { parseJsonSchema } from "@/utils/schemaParser"
 import { Search, X } from "lucide-react"
 
 export interface SelfDescribingEventPanelProps {
-  igluBaseUrl: string
-  availableSchemas: IgluSchemaRepr[]
+  organizationId: string
+  availableSchemas: DataStructure[]
   schemaSearchQuery: string
   setSchemaSearchQuery: (query: string) => void
-  filteredSchemas: IgluSchemaRepr[]
+  filteredSchemas: DataStructure[]
   showSelfDescribingSchemaDropdown: boolean
   selfDescribingFields: SchemaField[]
   setShowSelfDescribingSchemaDropdown: (show: boolean) => void
@@ -27,7 +28,7 @@ export interface SelfDescribingEventPanelProps {
 }
 
 export const SelfDescribingEventPanel = (
-    { igluBaseUrl, availableSchemas, schemaSearchQuery, setSchemaSearchQuery, 
+    { organizationId, availableSchemas, schemaSearchQuery, setSchemaSearchQuery, 
         showSelfDescribingSchemaDropdown, setShowSelfDescribingSchemaDropdown, 
         selfDescribingSchema, selfDescribingSchemaJson, setSelfDescribingSchema, 
         filteredSchemas, handleSelfDescribingSchemaSelect, setSelfDescribingSchemaJson,
@@ -38,7 +39,7 @@ export const SelfDescribingEventPanel = (
   return <FormSection title="Self-describing Event">
   <div className="space-y-4">
     {/* Schema Selection from Iglu */}
-    {igluBaseUrl && availableSchemas.length > 0 && (
+    {organizationId && availableSchemas.length > 0 && (
       <div>
         <label className="block text-sm font-medium text-gray-300 mb-2">
           Select Schema from Iglu Catalog
@@ -66,7 +67,7 @@ export const SelfDescribingEventPanel = (
           {schemaSearchQuery && filteredSchemas.length > 0 && (
             <div className="absolute z-20 w-full mt-1 bg-slate-800 border border-slate-700 rounded-lg shadow-lg max-h-64 overflow-y-auto">
               {filteredSchemas.map((schema, idx) => {
-                const uri = getSchemaUri(schema)
+                const uri = getSchemaUriFromDataStructure(schema)
                 if (!uri) return null
                 return (
                   <button
@@ -116,7 +117,7 @@ export const SelfDescribingEventPanel = (
                 Available schemas ({availableSchemas.length})
               </div>
               {availableSchemas.map((schema, idx) => {
-                const uri = getSchemaUri(schema)
+                const uri = getSchemaUriFromDataStructure(schema)
                 if (!uri) return null
                 return (
                   <button
